@@ -1,363 +1,138 @@
-import numpy as np
-import gymnasium as gym
-from gymnasium import spaces
-from collections import deque
-import matplotlib.pyplot as plt
-import io
-from PIL import Image
 import sys
 import os
-import argparse  # 导入 argparse 用于 main 测试
+import numpy as np
+from pathlib import Path
+import torch
 
-# --- 路径修复 ---
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+# 将项目根目录添加到 sys.path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+sys.path.append(project_root)
 
-from utils.profiler import get_model_profile
-from utils.trace import ResourceTrace
-from utils.partitioner import DynamicProgrammingPartitioner
+from config import get_config
+from envs.env_wrappers import DummyVecEnv
+from envs.pipe_sim_env import PipeSimEnv
 
 
-class PipeSimEnv(gym.Env):
-    """
-    流水线并行训练的高保真仿真环境 (PipeSimEnv)
-    - 新增支持同步(sync)和异步(async)两种时间模型
-    - 丰富了观察空间以提供更多决策依据
-    """
-    metadata = {'render.modes': ['human', 'rgb_array'], 'render_fps': 4}
+def make_train_env(all_args):
+    def get_env_fn(rank):
+        def init_env():
+            env = PipeSimEnv(all_args)
+            env.seed(all_args.seed + rank * 1000)
+            return env
 
-    def __init__(self, args):
-        self.args = args
-        self.num_gpus = args.num_agents
-        self.num_micro_batches = args.num_micro_batches
-        self.time_model = args.pipeline_time_model
+        return init_env
 
-        self.model_profile = get_model_profile(args.model_name)
-        self.num_layers = len(self.model_profile['layers'])
+    return DummyVecEnv([get_env_fn(i) for i in range(all_args.n_rollout_threads)])
 
-        self.trace_generator = ResourceTrace(self.num_gpus, args.episode_length, args.trace_path)
-        self.compute_trace, self.bandwidth_trace = self.trace_generator.get_trace(args.trace_type)
 
-        # --- 1. 更丰富的观察空间 ---
-        # [self_compute_load, self_comm_load, left_neighbor_load, right_neighbor_load, self_compute_power, left_bw, right_bw]
-        self.obs_dim = 7
-        share_obs_dim = self.obs_dim * self.num_gpus
-        self.observation_space = [spaces.Box(low=-np.inf, high=+np.inf, shape=(self.obs_dim,), dtype=np.float32) for _
-                                  in range(self.num_gpus)]
-        self.share_observation_space = [spaces.Box(low=-np.inf, high=+np.inf, shape=(share_obs_dim,), dtype=np.float32)
-                                        for _ in range(self.num_gpus)]
+def make_eval_env(all_args):
+    def get_env_fn(rank):
+        def init_env():
+            env = PipeSimEnv(all_args)
+            env.seed(all_args.seed + rank * 1000)
+            return env
 
-        # 动作空间保持不变
-        self.action_space = [spaces.Box(low=0, high=1, shape=(3,), dtype=np.float32) for _ in range(self.num_gpus)]
+        return init_env
 
-        # 初始化状态变量
-        self.time_step = 0
-        self.compute_power = self.compute_trace[0]
-        self.bandwidth = self.bandwidth_trace[0]
-        self.partition = self._get_initial_partition()
-        self.current_batch_time = self._get_batch_time(self.partition)
-        self.rewards_history = deque(maxlen=args.episode_length)
+    return DummyVecEnv([get_env_fn(i) for i in range(all_args.n_eval_rollout_threads)])
 
-    def _get_initial_partition(self):
-        if self.args.initial_partition_strategy == "dp":
-            print("--- 使用动态规划 (DP) 生成初始分区 ---")
-            partitioner = DynamicProgrammingPartitioner(
-                self.model_profile, self.num_gpus, self.compute_power, self.bandwidth
-            )
-            return partitioner.partition()
-        else:
-            print("--- 使用均匀 (Uniform) 方式生成初始分区 ---")
-            return self._get_uniform_partition()
 
-    def reset(self, seed=None, options=None):
-        if seed is not None:
-            np.random.seed(seed)
-        self.time_step = 0
-        self.compute_trace, self.bandwidth_trace = self.trace_generator.get_trace(self.args.trace_type)
-        self.compute_power = self.compute_trace[0]
-        self.bandwidth = self.bandwidth_trace[0]
-        self.partition = self._get_initial_partition()
-        self.current_batch_time = self._get_batch_time(self.partition)
-        self.rewards_history.clear()
-        obs = self._get_obs()
-        info = {}
-        return obs, info
+def parse_args(args, parser):
+    # AutoPipe 特有参数
+    parser.add_argument("--num_gpus", type=int, default=4, help="number of GPUs for pipeline parallelism")
+    parser.add_argument("--num_micro_batches", type=int, default=16, help="number of micro-batches in pipeline")
+    parser.add_argument("--model_name", type=str, default="gpt2-small", help="name of the model to profile")
+    parser.add_argument("--trace_type", type=str, default="sine", help="type of resource trace (sine, random, real)")
+    parser.add_argument("--trace_path", type=str, default=None,
+                        help="path to real trace data (if trace_type is 'real')")
+    parser.add_argument("--initial_partition_strategy", type=str, default="uniform",
+                        choices=["uniform", "dp"], help="strategy for initial partition")
+    parser.add_argument("--reward_throughput_factor", type=float, default=1.0,
+                        help="factor for throughput reward component")
+    parser.add_argument("--migration_cost_factor", type=float, default=0.1,
+                        help="factor for migration cost penalty")
+    parser.add_argument("--staleness_penalty_factor", type=float, default=0.0,
+                        help="factor for staleness penalty (set to 0 to disable)")
 
-    def step(self, action_decision):
-        migration_overhead_ms = 0
-        if action_decision:
-            from_gpu, to_gpu, layer_idx_global = action_decision
-            if layer_idx_global in self.partition[from_gpu] and abs(from_gpu - to_gpu) == 1:
-                layer_profile = self.model_profile['layers'][layer_idx_global]
-                self.partition[from_gpu].remove(layer_idx_global)
-                self.partition[to_gpu].append(layer_idx_global)
-                self.partition[to_gpu].sort()
-                # 确保带宽索引不出界
-                bw_index = min(from_gpu, to_gpu)
-                if bw_index < len(self.bandwidth):
-                    transfer_time_ms = (layer_profile['params_mb'] / self.bandwidth[bw_index]) * 1000
-                    migration_overhead_ms = self.args.migration_cost_factor * transfer_time_ms
+    # 由于环境现在是 AutoPipe，我们将 num_agents 与 num_gpus 关联
+    # 覆盖一些默认参数以适应新环境
+    all_args = parser.parse_known_args(args)[0]
+    all_args.num_agents = all_args.num_gpus
+    all_args.env_name = "AutoPipe"
+    all_args.scenario_name = f"{all_args.num_gpus}GPUs"
+    # AutoPipe 使用连续动作空间
+    all_args.share_policy = True  # CTDE 必须共享策略 (对于Critic)
 
-        self.time_step += 1
-        terminated = self.time_step >= self.args.episode_length
-        truncated = False
-        if not terminated:
-            self.compute_power = self.compute_trace[self.time_step]
-            self.bandwidth = self.bandwidth_trace[self.time_step]
+    # 设置连续动作空间
+    all_args.use_continuous_action = True
 
-        new_batch_time = self._get_batch_time(self.partition)
-        reward = self._get_reward(self.current_batch_time, new_batch_time, migration_overhead_ms)
-        self.current_batch_time = new_batch_time
-        self.rewards_history.append(reward)
-        obs = self._get_obs()
-        infos = [{"throughput": 1000.0 / self.current_batch_time if self.current_batch_time > 0 else 0} for _ in
-                 range(self.num_gpus)]
-        rewards = [[reward] for _ in range(self.num_gpus)]
+    return all_args
 
-        return obs, rewards, np.array([terminated] * self.num_gpus), np.array([truncated] * self.num_gpus), infos
 
-    def _get_stage_costs(self, partition):
-        """计算每个阶段的计算和通信成本（整个批次）。"""
-        stage_compute_costs = np.zeros(self.num_gpus)
-        stage_comm_costs = np.zeros(self.num_gpus)
+def main(args):
+    parser = get_config()
+    all_args = parse_args(args, parser)
 
-        for i in range(self.num_gpus):
-            if not partition[i]: continue
+    if all_args.algorithm_name not in ["rmappo", "mappo"]:
+        raise NotImplementedError
 
-            fwd_compute = sum(self.model_profile['layers'][l_idx]['forward_ms'] for l_idx in partition[i])
-            bwd_compute = sum(self.model_profile['layers'][l_idx]['backward_ms'] for l_idx in partition[i])
-            stage_compute_costs[i] = (fwd_compute + bwd_compute) / self.compute_power[i]
+    # cuda
+    if all_args.cuda and torch.cuda.is_available():
+        print("choose to use gpu...")
+        device = torch.device("cuda:0")
+        torch.set_num_threads(all_args.n_training_threads)
+        if all_args.cuda_deterministic:
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+    else:
+        print("choose to use cpu...")
+        device = torch.device("cpu")
+        torch.set_num_threads(all_args.n_training_threads)
 
-            if i < self.num_gpus - 1:
-                last_layer_idx = max(partition[i])
-                activation_size = self.model_profile['layers'][last_layer_idx]['activations_mb']
-                stage_comm_costs[i] = ((activation_size * 2) / self.bandwidth[i]) * 1000
+    # 路径设置
+    run_dir = (
+            Path("./results")
+            / all_args.env_name
+            / all_args.scenario_name
+            / all_args.algorithm_name
+            / all_args.experiment_name
+    )
+    if not run_dir.exists():
+        os.makedirs(str(run_dir))
 
-        return stage_compute_costs, stage_comm_costs
+    # seed
+    torch.manual_seed(all_args.seed)
+    torch.cuda.manual_seed_all(all_args.seed)
+    np.random.seed(all_args.seed)
 
-    def _get_batch_time(self, partition):
-        """根据配置的时间模型计算批处理时间。"""
-        if self.time_model == 'async':
-            return self._get_async_batch_time(partition)
-        elif self.time_model == 'sync':
-            return self._get_sync_batch_time(partition)
-        else:
-            raise ValueError(f"未知的时间模型: {self.time_model}")
+    # env init
+    envs = make_train_env(all_args)
+    eval_envs = make_eval_env(all_args) if all_args.use_eval else None
+    num_agents = all_args.num_agents
 
-    def _get_async_batch_time(self, partition):
-        """根据 PipeDream/DynPipe 的异步1F1B模型计算时间。"""
-        if not any(p for p in partition if p): return float('inf')
+    config = {
+        "all_args": all_args,
+        "envs": envs,
+        "eval_envs": eval_envs,
+        "num_agents": num_agents,
+        "device": device,
+        "run_dir": run_dir,
+    }
 
-        stage_compute_costs, stage_comm_costs = self._get_stage_costs(partition)
-        stage_total_times = stage_compute_costs + stage_comm_costs
+    # run experiments
+    # 对于 AutoPipe 的 CTDE 架构，我们总是使用 shared runner
+    from runner.shared.env_runner import EnvRunner as Runner
 
-        bottleneck_per_batch = np.max(stage_total_times)
+    runner = Runner(config)
+    runner.run()
 
-        return bottleneck_per_batch
-
-    def _get_sync_batch_time(self, partition):
-        """根据 ARPipe 论文的同步模型计算时间。"""
-        if self.num_micro_batches < 1 or not any(p for p in partition if p): return float('inf')
-
-        stage_compute_costs, stage_comm_costs = self._get_stage_costs(partition)
-
-        stage_total_micro_time = (stage_compute_costs + stage_comm_costs) / self.num_micro_batches
-
-        bottleneck_micro_time = np.max(stage_total_micro_time) if len(
-            stage_total_micro_time[stage_total_micro_time > 0]) > 0 else 0
-
-        total_time_ms = np.sum(stage_total_micro_time) * (self.num_gpus - 1) + (
-                    self.num_micro_batches - 1) * bottleneck_micro_time
-
-        return total_time_ms if total_time_ms > 0 else float('inf')
-
-    def _get_obs(self):
-        """生成更丰富的观察。"""
-        all_obs = []
-        stage_compute_costs, stage_comm_costs = self._get_stage_costs(self.partition)
-
-        total_compute_base = sum(l['forward_ms'] + l['backward_ms'] for l in self.model_profile['layers'])
-        total_comm_base = sum(l['activations_mb'] for l in self.model_profile['layers'])
-
-        for i in range(self.num_gpus):
-            my_compute_load = stage_compute_costs[i]
-            my_comm_load = stage_comm_costs[i]
-
-            left_neighbor_load = stage_compute_costs[i - 1] if i > 0 else 0
-            right_neighbor_load = stage_compute_costs[i + 1] if i < self.num_gpus - 1 else 0
-
-            my_compute_power = self.compute_power[i]
-            left_bw = self.bandwidth[i - 1] if i > 0 else 0
-            right_bw = self.bandwidth[i] if i < self.num_gpus - 1 else 0
-
-            obs = np.array([
-                my_compute_load / total_compute_base if total_compute_base > 0 else 0,
-                my_comm_load / total_comm_base if total_comm_base > 0 else 0,
-                left_neighbor_load / total_compute_base if total_compute_base > 0 else 0,
-                right_neighbor_load / total_compute_base if total_compute_base > 0 else 0,
-                my_compute_power,
-                left_bw / 1000.0,
-                right_bw / 1000.0,
-            ])
-            all_obs.append(obs)
-
-        return np.array(all_obs)
-
-    def _get_reward(self, old_batch_time_ms, new_batch_time_ms, migration_overhead_ms):
-        time_saving_ms = old_batch_time_ms - new_batch_time_ms
-        reward = self.args.reward_throughput_factor * time_saving_ms
-        reward -= migration_overhead_ms
-        num_active_stages = len([p for p in self.partition if p])
-        staleness_penalty = self.args.staleness_penalty_factor * (num_active_stages ** 2)
-        reward -= staleness_penalty
-        return reward
-
-    def _get_uniform_partition(self):
-        partition = [[] for _ in range(self.num_gpus)]
-        layers_per_gpu = self.num_layers // self.num_gpus
-        remainder = self.num_layers % self.num_gpus
-        current_layer = 0
-        for i in range(self.num_gpus):
-            num_layers_on_this_gpu = layers_per_gpu + (1 if i < remainder else 0)
-            for _ in range(num_layers_on_this_gpu):
-                partition[i].append(current_layer)
-                current_layer += 1
-        return partition
-
-    def seed(self, seed=None):
-        if seed is None:
-            np.random.seed(1)
-        else:
-            np.random.seed(seed)
-
-    def close(self):
-        plt.close('all')
-
-    def render(self, mode='rgb_array'):
-        if mode == 'rgb_array':
-            fig, ax = plt.subplots(figsize=(14, 8), dpi=100)
-            fig.patch.set_facecolor('#f0f0f0')
-
-            gpu_colors = plt.get_cmap('viridis', self.num_gpus)
-
-            compute_costs, comm_costs = self._get_stage_costs(self.partition)
-            stage_total = compute_costs + comm_costs
-            bottleneck_time = np.max(stage_total) if len(stage_total) > 0 and np.any(stage_total) else 0
-
-            for i in range(self.num_gpus):
-                is_bottleneck = np.isclose(stage_total[i], bottleneck_time) and bottleneck_time > 0
-                edgecolor = 'red' if is_bottleneck else 'black'
-                linewidth = 3.0 if is_bottleneck else 1.0
-
-                ax.add_patch(plt.Rectangle((i * 1.5, 0), 1, 6, facecolor=gpu_colors(i), alpha=0.1, edgecolor=edgecolor,
-                                           linewidth=linewidth, zorder=0))
-                ax.text(i * 1.5 + 0.5, 6.2, f'GPU {i}', ha='center', fontsize=12, weight='bold')
-                ax.text(i * 1.5 + 0.5, -0.4, f'阶段耗时: {stage_total[i]:.1f}ms', ha='center', fontsize=9,
-                        color='red' if is_bottleneck else 'black')
-
-                if self.partition[i]:
-                    y_pos = 5.5
-                    for layer_idx in sorted(self.partition[i]):
-                        ax.add_patch(plt.Rectangle((i * 1.5 + 0.1, y_pos), 0.8, 0.4, facecolor=gpu_colors(i), alpha=0.6,
-                                                   zorder=1))
-                        ax.text(i * 1.5 + 0.5, y_pos + 0.2, f'L{layer_idx}', ha='center', va='center', color='white',
-                                fontsize=8, weight='bold')
-                        y_pos -= 0.5
-
-            title_str = f'Pipe 状态面板 (模型: {self.args.model_name}, 时间模型: {self.time_model}) - 时间步: {self.time_step}'
-            reward_val = self.rewards_history[-1] if self.rewards_history else 0
-            throughput = 1000.0 / self.current_batch_time if self.current_batch_time > 0 and self.current_batch_time != float(
-                'inf') else 0
-            info_str = f'总批次时间: {self.current_batch_time:.2f} ms | 吞吐量: {throughput:.2f} samples/sec | 上一步奖励: {reward_val:.2f}'
-            ax.set_title(title_str, fontsize=16)
-            fig.text(0.5, 0.01, info_str, ha='center', fontsize=12)
-
-            ax.set_xlim(-0.5, self.num_gpus * 1.5 - 0.5)
-            ax.set_ylim(-1.5, 7)
-            ax.axis('off')
-            plt.tight_layout(rect=[0, 0.05, 1, 0.95])
-
-            buf = io.BytesIO()
-            fig.savefig(buf, format='png', bbox_inches='tight', pad_inches=0)
-            buf.seek(0)
-            img = Image.open(buf)
-            img_arr = np.array(img)
-            buf.close()
-            plt.close(fig)
-
-            return img_arr[:, :, :3]
-        else:
-            raise NotImplementedError
+    # post process
+    envs.close()
+    if all_args.use_eval and eval_envs is not envs:
+        eval_envs.close()
 
 
 if __name__ == "__main__":
-    # --- 用于独立测试环境的 main 函数 ---
-
-    # 1. 创建一个 mock 的 args 对象来模拟命令行参数
-    #    这样我们就不需要一个完整的 config.py 就能测试
-    mock_args = argparse.Namespace(
-        num_agents=4,
-        model_name="VGG16",
-        episode_length=200,
-        trace_type="sin_wave",
-        trace_path=None,
-        initial_partition_strategy="dp",
-        pipeline_time_model="async",
-        num_micro_batches=8,
-        migration_cost_factor=0.1,
-        reward_throughput_factor=1.0,
-        staleness_penalty_factor=0.01
-    )
-
-    # 2. 初始化环境
-    print("=" * 50)
-    print("正在初始化 PipeSimEnv 进行独立测试...")
-    env = PipeSimEnv(args=mock_args)
-    obs, info = env.reset()
-    print("环境初始化完成。")
-    print(f"初始观察维度: {obs.shape}")
-    print("=" * 50)
-
-    # 3. 运行一个简短的 episode
-    total_reward = 0
-    for i in range(10):
-        print(f"\n--- 时间步 {i + 1} ---")
-
-        # 模拟一个随机决策：50%的概率什么都不做
-        if np.random.rand() < 0.5:
-            decision = None
-            print("决策: 无操作")
-        else:
-            # 随机选择一个GPU尝试迁移
-            from_gpu = np.random.randint(0, env.num_gpus)
-            # 随机决定向左还是向右
-            direction = np.random.choice([-1, 1])
-            to_gpu = from_gpu + direction
-
-            # 确保目标GPU有效且源GPU有层可移
-            if 0 <= to_gpu < env.num_gpus and env.partition[from_gpu]:
-                layer_to_move = env.partition[from_gpu][-1] if direction == 1 else env.partition[from_gpu][0]
-                decision = (from_gpu, to_gpu, layer_to_move)
-                print(f"决策: 从 GPU {from_gpu} 向 GPU {to_gpu} 迁移层 {layer_to_move}")
-            else:
-                decision = None
-                print("决策: (无效) 无操作")
-
-        # 执行环境步骤
-        obs, rewards, terminated, truncated, infos = env.step(decision)
-
-        # 打印结果
-        reward_sum = np.sum(rewards)
-        total_reward += reward_sum
-        print(f"当前奖励: {reward_sum:.4f}")
-        print(f"当前总批次时间: {env.current_batch_time:.2f} ms")
-        print(f"当前吞吐量: {infos[0]['throughput']:.2f} samples/sec")
-        if np.any(terminated):
-            print("Episode 结束!")
-            break
-
-    print("\n" + "=" * 50)
-    print(f"测试完成。10个时间步的总奖励: {total_reward:.4f}")
-    print("=" * 50)
-
-    env.close()
-
+    # 移除 `train.py` 自身，只传递超参数
+    main(sys.argv[1:])
